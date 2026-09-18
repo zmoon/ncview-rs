@@ -8,6 +8,7 @@ pub mod grib2_identity;
 pub mod grib2_index;
 pub mod grib2_manifest;
 pub mod grib2_types;
+pub mod mpas;
 pub mod netcdf4;
 pub mod remote;
 pub mod remote_grib2;
@@ -176,6 +177,12 @@ pub trait DataSource: Send + Sync {
 
 pub fn open(path: impl AsRef<Path>) -> Result<Box<dyn DataSource>> {
     let path = path.as_ref();
+    open_with_grid(path, None::<&Path>)
+}
+
+pub fn open_with_grid(path: impl AsRef<Path>, grid_path: Option<&Path>) -> Result<Box<dyn DataSource>> {
+    let path = path.as_ref();
+    let grid_path = grid_path;
     let extension_matches = path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -194,13 +201,38 @@ pub fn open(path: impl AsRef<Path>) -> Result<Box<dyn DataSource>> {
     if extension_matches || magic_matches {
         grib2::Grib2Source::open(path).map(|source| Box::new(source) as Box<dyn DataSource>)
     } else {
-        netcdf4::NetCdf4Source::open(path).map(|source| Box::new(source) as Box<dyn DataSource>)
+        let source = netcdf4::NetCdf4Source::open(path)?;
+        if let Some(mesh) = mpas::detect(source.metadata()) {
+            let mut path_for_grid = grid_path;
+            if path_for_grid.is_none() {
+                path_for_grid = Some(path);
+            }
+            let wrapped = mpas::MpasSource::open(path, path_for_grid).map(|source| source as Box<dyn DataSource>)?;
+            if matches!(mesh, mpas::MeshLocation::Cell | mpas::MeshLocation::Vertex) {
+                return Ok(wrapped);
+            }
+        }
+        Ok(Box::new(source) as Box<dyn DataSource>)
     }
 }
 
 /// Open either a local path or an explicit cloud object location.
 pub fn open_location(location: impl AsRef<str>) -> Result<Box<dyn DataSource>> {
     open_location_with_progress(location, &|_| true)
+}
+
+pub fn open_location_with_grid(
+    location: impl AsRef<str>,
+    grid: Option<&str>,
+) -> Result<Box<dyn DataSource>> {
+    let source = SourceLocation::parse(location.as_ref())?;
+    if source.is_remote() {
+        remote::open_remote_with_progress(source, &|_| true)
+    } else {
+        let path = source.local_path().expect("local source has a path");
+        let grid_path = grid.map(Path::new);
+        open_with_grid(path, grid_path)
+    }
 }
 
 pub fn open_location_with_progress(

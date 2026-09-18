@@ -29,3 +29,11 @@ fn manifest_subcommand_describes_both_profiles() {
     assert!(help.contains("kerchunk"));
     assert!(help.contains("virtualizarr"));
 }
+
+#[test]
+fn grid_flag_appears_in_help() {
+    let output = ncv().arg("--help").output().unwrap();
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success());
+    assert!(help.contains("--grid"));
+}

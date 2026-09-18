@@ -48,6 +48,9 @@ struct Cli {
     /// One or more NetCDF-4 or GRIB2 datasets to inspect. Shell globs are supported.
     #[arg(value_name = "DATASET", num_args = 0..)]
     dataset: Vec<String>,
+    /// MPAS mesh/coordinate file supplying latCell/lonCell or latVertex/lonVertex.
+    #[arg(long, value_name = "GRID")]
+    grid: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -138,15 +141,16 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     }
-    if let Err(error) = run(&cli.dataset) {
+    if let Err(error) = run(&cli.dataset, cli.grid.as_deref()) {
         eprintln!("ncv: {error}");
         return ExitCode::from(2);
     }
     ExitCode::SUCCESS
 }
 
-fn run(datasets: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+fn run(datasets: &[String], grid: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let datasets = datasets.to_vec();
+    let grid = grid.map(str::to_owned);
     let (stdout_tx, stdout_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     std::thread::spawn(move || {
         use std::io::Write;
@@ -200,6 +204,7 @@ fn run(datasets: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         let load_tx = load_tx.clone();
         let worker_cancelled = Arc::clone(&cancelled);
+        let grid_for_worker = grid.clone();
         std::thread::spawn(move || {
             if worker_cancelled.load(Ordering::Relaxed) {
                 return;
@@ -213,17 +218,27 @@ fn run(datasets: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let progress_tx = load_tx.clone();
             let progress_cancelled = Arc::clone(&worker_cancelled);
             let result = catch_unwind(AssertUnwindSafe(|| {
-                data::open_location_with_progress(&dataset, &|message| {
+                if let Some(grid_path) = grid_for_worker.as_deref() {
+                    data::open_location_with_grid(&dataset, Some(grid_path))
+                } else {
+                    data::open_location_with_progress(&dataset, &|message| {
+                        if progress_cancelled.load(Ordering::Relaxed) {
+                            return false;
+                        }
+                        progress_tx
+                            .send(SourceLoadMessage::Progress(
+                                index,
+                                loading_phase(message),
+                                message.to_owned(),
+                            ))
+                            .is_ok()
+                    })
+                }
+                .and_then(|source| {
                     if progress_cancelled.load(Ordering::Relaxed) {
-                        return false;
+                        return Err(ncview_rs::error::NcvError::WorkerStopped);
                     }
-                    progress_tx
-                        .send(SourceLoadMessage::Progress(
-                            index,
-                            loading_phase(message),
-                            message.to_owned(),
-                        ))
-                        .is_ok()
+                    Ok(source)
                 })
             }))
             .map_err(|_| format!("{dataset}: loader panicked"))
