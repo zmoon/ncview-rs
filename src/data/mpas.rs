@@ -40,7 +40,6 @@ impl MeshLocation {
 
 pub struct MpasSource {
     inner: Box<dyn MeshValueSource>,
-    mesh: MeshLocation,
     grid: Option<Box<dyn MeshValueSource>>,
     path: PathBuf,
 }
@@ -154,11 +153,10 @@ impl MpasSource {
             ),
         })?;
 
-        let has_local_coordinates = local_coordinates_present(&metadata, mesh);
+        let has_local_coordinates = local_coordinates_present(&metadata);
         if has_local_coordinates {
             return Ok(Box::new(Self {
                 inner: source,
-                mesh,
                 grid: None,
                 path: path.to_path_buf(),
             }) as Box<dyn DataSource>);
@@ -181,7 +179,6 @@ impl MpasSource {
         let grid_source = open_mesh_source(grid_path)?;
         Ok(Box::new(Self {
             inner: source,
-            mesh,
             grid: Some(grid_source),
             path: path.to_path_buf(),
         }) as Box<dyn DataSource>)
@@ -191,8 +188,8 @@ impl MpasSource {
         self.grid.as_deref().unwrap_or(self.inner.as_ref())
     }
 
-    fn read_mesh_coordinates(&self) -> Result<(Vec<f64>, Vec<f64>)> {
-        let (lat_name, lon_name) = self.mesh.coordinate_names();
+    fn read_mesh_coordinates(&self, mesh: MeshLocation) -> Result<(Vec<f64>, Vec<f64>)> {
+        let (lat_name, lon_name) = mesh.coordinate_names();
         let source = self.coordinate_source();
         let lat = source.read_variable_values(lat_name)?;
         let lon = source.read_variable_values(lon_name)?;
@@ -219,7 +216,13 @@ impl MpasSource {
         Ok((lat_deg, lon_deg))
     }
 
-    fn read_mesh_values_for_variable(&self, variable: &str) -> Result<Vec<f64>> {
+    fn read_mesh_values_for_variable(
+        &self,
+        variable: &str,
+        time: usize,
+        depth: usize,
+    ) -> Result<(MeshLocation, Vec<f64>)> {
+        let mesh = self.mesh_for_variable(variable)?;
         let values = self.inner.read_variable_values(variable)?;
         if values.is_empty() {
             return Err(NcvError::InvalidDataset {
@@ -227,8 +230,158 @@ impl MpasSource {
                 reason: format!("MPAS mesh variable '{variable}' is empty"),
             });
         }
-        Ok(values)
+        select_mesh_values(
+            &values,
+            self.inner.metadata(),
+            variable,
+            mesh.dimension_name(),
+            time,
+            depth,
+        )
+        .map(|values| (mesh, values))
     }
+
+    fn mesh_for_variable(&self, variable: &str) -> Result<MeshLocation> {
+        let variable_metadata = self
+            .inner
+            .metadata()
+            .variables
+            .iter()
+            .find(|item| item.name == variable)
+            .ok_or_else(|| NcvError::UnsupportedVariable {
+                variable: variable.to_owned(),
+                reason: "variable not found".into(),
+            })?;
+        if variable_metadata
+            .dimensions
+            .iter()
+            .any(|dimension| dimension == MeshLocation::Cell.dimension_name())
+        {
+            return Ok(MeshLocation::Cell);
+        }
+        if variable_metadata
+            .dimensions
+            .iter()
+            .any(|dimension| dimension == MeshLocation::Vertex.dimension_name())
+        {
+            return Ok(MeshLocation::Vertex);
+        }
+        Err(NcvError::UnsupportedVariable {
+            variable: variable.to_owned(),
+            reason: "variable does not use nCells or nVertices".into(),
+        })
+    }
+}
+
+fn select_mesh_values(
+    values: &[f64],
+    metadata: &DatasetMetadata,
+    variable: &str,
+    mesh_dimension: &str,
+    time: usize,
+    depth: usize,
+) -> Result<Vec<f64>> {
+    let variable_metadata = metadata
+        .variables
+        .iter()
+        .find(|item| item.name == variable)
+        .ok_or_else(|| NcvError::UnsupportedVariable {
+            variable: variable.to_owned(),
+            reason: "variable not found".into(),
+        })?;
+    let dimensions = variable_metadata
+        .dimensions
+        .iter()
+        .map(|name| {
+            let length = metadata
+                .dimensions
+                .iter()
+                .find(|dimension| dimension.name == *name)
+                .map(|dimension| dimension.length)
+                .ok_or_else(|| NcvError::InvalidDataset {
+                    path: metadata.path.clone().into(),
+                    reason: format!("variable '{variable}' references unknown dimension '{name}'"),
+                })?;
+            Ok((name.as_str(), length))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let expected = dimensions
+        .iter()
+        .try_fold(1_usize, |product, (_, length)| product.checked_mul(*length))
+        .ok_or_else(|| NcvError::InvalidSlice("MPAS variable shape overflows usize".into()))?;
+    if expected != values.len() {
+        return Err(NcvError::Adapter {
+            path: metadata.path.clone().into(),
+            reason: format!(
+                "variable '{variable}' returned {} values, expected {expected}",
+                values.len()
+            ),
+        });
+    }
+    let mesh_axis = dimensions
+        .iter()
+        .position(|(name, _)| *name == mesh_dimension)
+        .ok_or_else(|| NcvError::UnsupportedVariable {
+            variable: variable.to_owned(),
+            reason: format!("variable does not use mesh dimension '{mesh_dimension}'"),
+        })?;
+    let mesh_length = dimensions[mesh_axis].1;
+    let mut output = Vec::with_capacity(mesh_length);
+    for mesh_index in 0..mesh_length {
+        let mut linear_index = 0_usize;
+        for (axis, (name, length)) in dimensions.iter().enumerate() {
+            let index = if axis == mesh_axis {
+                mesh_index
+            } else if is_time_dimension(name) {
+                time
+            } else if is_vertical_dimension(name) {
+                depth
+            } else if *length == 1 {
+                0
+            } else {
+                return Err(NcvError::UnsupportedVariable {
+                    variable: variable.to_owned(),
+                    reason: format!("non-spatial dimension '{name}' needs a time/depth role"),
+                });
+            };
+            if index >= *length {
+                return Err(NcvError::InvalidSlice(format!(
+                    "index {index} exceeds dimension '{name}' length {length}"
+                )));
+            }
+            let stride = dimensions
+                .iter()
+                .skip(axis + 1)
+                .try_fold(1_usize, |product, (_, length)| product.checked_mul(*length))
+                .ok_or_else(|| {
+                    NcvError::InvalidSlice("MPAS variable stride overflows usize".into())
+                })?;
+            linear_index = linear_index
+                .checked_add(index.checked_mul(stride).ok_or_else(|| {
+                    NcvError::InvalidSlice("MPAS variable index overflows usize".into())
+                })?)
+                .ok_or_else(|| {
+                    NcvError::InvalidSlice("MPAS variable index overflows usize".into())
+                })?;
+        }
+        output.push(values[linear_index]);
+    }
+    Ok(output)
+}
+
+fn is_time_dimension(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("time") || lower == "date" || lower == "dates"
+}
+
+fn is_vertical_dimension(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("depth")
+        || lower.contains("level")
+        || lower.contains("lev")
+        || lower.contains("pressure")
+        || lower.contains("height")
+        || lower.contains("altitude")
 }
 
 fn open_mesh_source(path: &Path) -> Result<Box<dyn MeshValueSource>> {
@@ -245,8 +398,9 @@ impl DataSource for MpasSource {
     }
 
     fn read_slice(&self, request: &super::slice::SliceRequest) -> Result<super::slice::Slice2D> {
-        let mesh_values = self.read_mesh_values_for_variable(&request.variable)?;
-        let (lat_deg, lon_deg) = self.read_mesh_coordinates()?;
+        let (mesh, mesh_values) =
+            self.read_mesh_values_for_variable(&request.variable, request.time, request.depth)?;
+        let (lat_deg, lon_deg) = self.read_mesh_coordinates(mesh)?;
         if lat_deg.len() != mesh_values.len() {
             return Err(NcvError::InvalidDataset {
                 path: self.path.clone(),
@@ -398,12 +552,20 @@ pub fn detect(metadata: &DatasetMetadata) -> Option<MeshLocation> {
     None
 }
 
-fn local_coordinates_present(metadata: &DatasetMetadata, mesh: MeshLocation) -> bool {
-    let (lat_name, lon_name) = mesh.coordinate_names();
-    metadata
-        .variables
-        .iter()
-        .any(|variable| variable.name == lat_name || variable.name == lon_name)
+fn local_coordinates_present(metadata: &DatasetMetadata) -> bool {
+    [MeshLocation::Cell, MeshLocation::Vertex]
+        .into_iter()
+        .any(|mesh| {
+            let (lat_name, lon_name) = mesh.coordinate_names();
+            metadata
+                .variables
+                .iter()
+                .any(|variable| variable.name == lat_name)
+                && metadata
+                    .variables
+                    .iter()
+                    .any(|variable| variable.name == lon_name)
+        })
 }
 
 #[cfg(test)]
@@ -432,5 +594,43 @@ mod tests {
         assert_eq!(lat_axis.len(), 2);
         assert_eq!(lon_axis.len(), 2);
         assert!(output.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn selects_time_and_vertical_plane_for_mesh_dimension() {
+        let metadata = DatasetMetadata {
+            path: "fixture.nc".into(),
+            format: super::super::DatasetFormat::NetCdf3,
+            dimensions: vec![
+                super::super::Dimension {
+                    name: "Time".into(),
+                    length: 2,
+                    role: super::super::AxisRole::Time,
+                },
+                super::super::Dimension {
+                    name: "nVertices".into(),
+                    length: 3,
+                    role: super::super::AxisRole::Other,
+                },
+                super::super::Dimension {
+                    name: "nVertLevels".into(),
+                    length: 2,
+                    role: super::super::AxisRole::Depth,
+                },
+            ],
+            variables: vec![super::super::Variable {
+                name: "field".into(),
+                dimensions: vec!["Time".into(), "nVertices".into(), "nVertLevels".into()],
+                numeric: true,
+                units: None,
+                long_name: None,
+                standard_name: None,
+            }],
+        };
+        let values = (0..12).map(f64::from).collect::<Vec<_>>();
+
+        let selected = select_mesh_values(&values, &metadata, "field", "nVertices", 1, 0).unwrap();
+
+        assert_eq!(selected, [6.0, 8.0, 10.0]);
     }
 }

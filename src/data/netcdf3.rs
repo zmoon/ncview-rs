@@ -1,7 +1,7 @@
 use std::{
-    collections::HashMap,
     fs::File,
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 use ndarray::Array2;
@@ -16,7 +16,7 @@ use crate::error::{NcvError, Result};
 pub struct NetCdf3Source {
     path: PathBuf,
     metadata: DatasetMetadata,
-    values: HashMap<String, Vec<f64>>,
+    reader: Mutex<NcFile>,
 }
 
 pub fn is_netcdf3(path: &Path) -> bool {
@@ -35,41 +35,25 @@ impl NetCdf3Source {
             reason: error.to_string(),
         })?;
         let metadata = metadata(path, &reader)?;
-        let variables = reader
-            .variables()
-            .map_err(|error| NcvError::InvalidDataset {
-                path: path.to_path_buf(),
-                reason: error.to_string(),
-            })?;
-        let mut values = HashMap::with_capacity(variables.len());
-        for variable in variables {
-            if !is_numeric_type(&variable.dtype) {
-                continue;
-            }
-            let name = variable.name.clone();
-            let data = reader
-                .read_variable_as_f64(&name)
-                .map_err(|error| NcvError::Adapter {
-                    path: path.to_path_buf(),
-                    reason: error.to_string(),
-                })?;
-            values.insert(name, data.into_iter().collect());
-        }
         Ok(Self {
             path: path.to_path_buf(),
             metadata,
-            values,
+            reader: Mutex::new(reader),
         })
     }
 
     pub(crate) fn read_variable_values(&self, variable: &str) -> Result<Vec<f64>> {
-        self.values
-            .get(variable)
-            .cloned()
-            .ok_or_else(|| NcvError::UnsupportedVariable {
-                variable: variable.to_string(),
-                reason: "variable not found".into(),
-            })
+        let reader = self.reader.lock().map_err(|_| NcvError::Adapter {
+            path: self.path.clone(),
+            reason: "NetCDF-3 reader lock was poisoned".into(),
+        })?;
+        let values = reader
+            .read_variable_as_f64(variable)
+            .map_err(|error| NcvError::Adapter {
+                path: self.path.clone(),
+                reason: error.to_string(),
+            })?;
+        Ok(values.into_iter().collect())
     }
 }
 
