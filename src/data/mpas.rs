@@ -46,17 +46,53 @@ pub struct MpasSource {
 
 trait MeshValueSource: DataSource {
     fn read_variable_values(&self, variable: &str) -> Result<Vec<f64>>;
+
+    fn read_mesh_values(
+        &self,
+        variable: &str,
+        time: usize,
+        depth: usize,
+        mesh_dimension: &str,
+    ) -> Result<Vec<f64>>;
 }
 
 impl MeshValueSource for NetCdf4Source {
     fn read_variable_values(&self, variable: &str) -> Result<Vec<f64>> {
         NetCdf4Source::read_variable_values(self, variable)
     }
+
+    fn read_mesh_values(
+        &self,
+        variable: &str,
+        time: usize,
+        depth: usize,
+        mesh_dimension: &str,
+    ) -> Result<Vec<f64>> {
+        let values = NetCdf4Source::read_variable_values(self, variable)?;
+        select_mesh_values(
+            &values,
+            self.metadata(),
+            variable,
+            mesh_dimension,
+            time,
+            depth,
+        )
+    }
 }
 
 impl MeshValueSource for NetCdf3Source {
     fn read_variable_values(&self, variable: &str) -> Result<Vec<f64>> {
         NetCdf3Source::read_variable_values(self, variable)
+    }
+
+    fn read_mesh_values(
+        &self,
+        variable: &str,
+        time: usize,
+        depth: usize,
+        mesh_dimension: &str,
+    ) -> Result<Vec<f64>> {
+        NetCdf3Source::read_mesh_values(self, variable, time, depth, mesh_dimension)
     }
 }
 
@@ -223,22 +259,9 @@ impl MpasSource {
         depth: usize,
     ) -> Result<(MeshLocation, Vec<f64>)> {
         let mesh = self.mesh_for_variable(variable)?;
-        let values = self.inner.read_variable_values(variable)?;
-        if values.is_empty() {
-            return Err(NcvError::InvalidDataset {
-                path: self.path.clone(),
-                reason: format!("MPAS mesh variable '{variable}' is empty"),
-            });
-        }
-        select_mesh_values(
-            &values,
-            self.inner.metadata(),
-            variable,
-            mesh.dimension_name(),
-            time,
-            depth,
-        )
-        .map(|values| (mesh, values))
+        self.inner
+            .read_mesh_values(variable, time, depth, mesh.dimension_name())
+            .map(|values| (mesh, values))
     }
 
     fn mesh_for_variable(&self, variable: &str) -> Result<MeshLocation> {
@@ -273,7 +296,7 @@ impl MpasSource {
     }
 }
 
-fn select_mesh_values(
+pub(crate) fn select_mesh_values(
     values: &[f64],
     metadata: &DatasetMetadata,
     variable: &str,
