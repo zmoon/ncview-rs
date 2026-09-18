@@ -45,7 +45,7 @@ use ncview_rs::{
 struct Cli {
     #[command(subcommand)]
     command: Option<CliCommand>,
-    /// One or more NetCDF-4 or GRIB2 datasets to inspect. Shell globs are supported.
+    /// One or more NetCDF-3, NetCDF-4, or GRIB2 datasets to inspect. Shell globs are supported.
     #[arg(value_name = "DATASET", num_args = 0..)]
     dataset: Vec<String>,
     /// MPAS mesh/coordinate file supplying latCell/lonCell or latVertex/lonVertex.

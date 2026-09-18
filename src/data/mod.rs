@@ -9,6 +9,7 @@ pub mod grib2_index;
 pub mod grib2_manifest;
 pub mod grib2_types;
 pub mod mpas;
+pub mod netcdf3;
 pub mod netcdf4;
 pub mod remote;
 pub mod remote_grib2;
@@ -29,6 +30,7 @@ use crate::storage::location::SourceLocation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatasetFormat {
+    NetCdf3,
     NetCdf4,
     Grib2,
 }
@@ -202,6 +204,12 @@ pub fn open_with_grid(
         .is_ok_and(|magic| magic == *b"GRIB");
     if extension_matches || magic_matches {
         grib2::Grib2Source::open(path).map(|source| Box::new(source) as Box<dyn DataSource>)
+    } else if netcdf3::is_netcdf3(path) {
+        let source = netcdf3::NetCdf3Source::open(path)?;
+        if mpas::detect(source.metadata()).is_some() {
+            return mpas::MpasSource::open(path, grid_path);
+        }
+        Ok(Box::new(source) as Box<dyn DataSource>)
     } else {
         let source = netcdf4::NetCdf4Source::open(path)?;
         if let Some(mesh) = mpas::detect(source.metadata()) {

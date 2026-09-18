@@ -20,6 +20,16 @@ regression test reads both variables and checks their 4×5 slices. Regenerate it
 ncgen -4 -o tests/fixtures/coards-float32.nc4 tests/fixtures/coards-float32.cdl
 ```
 
+The MPAS NetCDF-3 smoke test uses a small generated field and a real mesh downloaded only by the
+ignored integration test. CI downloads the UCAR `x1.2562` mesh before running that test; ordinary
+`cargo test` remains deterministic and does not require network access.
+
+Regenerate the committed MPAS fixture with:
+
+```sh
+cargo run --example generate_fixtures
+```
+
 Generated fixture hashes (SHA-256):
 
 - `regular.nc4`: `9759f4bc44bc326c93dc0f8aeefda44f945a2673f207d7696f61c901d5fbcd48`
@@ -28,3 +38,4 @@ Generated fixture hashes (SHA-256):
 - `netcdf3-unsupported.nc`: `d71eff333e000bb7d3e1856b65e23650801ccc9c4851aa9da01eca756b49aa64`
 - `corrupt.nc`: `8141db4372deed39e7986ae7cbe7faef02e34c55f73b886a01750abb5dd3442c`
 - `coards-float32.nc4`: `40f0517505fd85e4e30300ee9dae9b59c71086f2ea4db1c7552c6ca87313f197`
+- `mpas-small.nc`: `32ed2fc02d393a146a939d43e1ba167d7f486e12981a7e7b0fc6307dbfb88ac6`

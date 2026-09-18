@@ -7,6 +7,7 @@ use crate::error::{NcvError, Result};
 
 use super::{
     DataSource, DatasetMetadata,
+    netcdf3::NetCdf3Source,
     netcdf4::NetCdf4Source,
     normalize_longitude,
     slice::{CoordinateGrid, Slice2D, Validity},
@@ -38,10 +39,26 @@ impl MeshLocation {
 }
 
 pub struct MpasSource {
-    inner: NetCdf4Source,
+    inner: Box<dyn MeshValueSource>,
     mesh: MeshLocation,
-    grid: Option<NetCdf4Source>,
+    grid: Option<Box<dyn MeshValueSource>>,
     path: PathBuf,
+}
+
+trait MeshValueSource: DataSource {
+    fn read_variable_values(&self, variable: &str) -> Result<Vec<f64>>;
+}
+
+impl MeshValueSource for NetCdf4Source {
+    fn read_variable_values(&self, variable: &str) -> Result<Vec<f64>> {
+        NetCdf4Source::read_variable_values(self, variable)
+    }
+}
+
+impl MeshValueSource for NetCdf3Source {
+    fn read_variable_values(&self, variable: &str) -> Result<Vec<f64>> {
+        NetCdf3Source::read_variable_values(self, variable)
+    }
 }
 
 fn radians_to_degrees(value: f64) -> f64 {
@@ -119,7 +136,15 @@ fn synthetic_window(
 
 impl MpasSource {
     pub fn open(path: &Path, grid_path: Option<&Path>) -> Result<Box<dyn DataSource>> {
-        let source = NetCdf4Source::open(path)?;
+        let source = open_mesh_source(path)?;
+        Self::from_source(path, source, grid_path)
+    }
+
+    fn from_source(
+        path: &Path,
+        source: Box<dyn MeshValueSource>,
+        grid_path: Option<&Path>,
+    ) -> Result<Box<dyn DataSource>> {
         let metadata = source.metadata().clone();
         let mesh = detect(&metadata).ok_or_else(|| NcvError::InvalidDataset {
             path: path.to_path_buf(),
@@ -153,7 +178,7 @@ impl MpasSource {
             });
         };
 
-        let grid_source = NetCdf4Source::open(grid_path)?;
+        let grid_source = open_mesh_source(grid_path)?;
         Ok(Box::new(Self {
             inner: source,
             mesh,
@@ -162,8 +187,8 @@ impl MpasSource {
         }) as Box<dyn DataSource>)
     }
 
-    fn coordinate_source(&self) -> &NetCdf4Source {
-        self.grid.as_ref().unwrap_or(&self.inner)
+    fn coordinate_source(&self) -> &dyn MeshValueSource {
+        self.grid.as_deref().unwrap_or(self.inner.as_ref())
     }
 
     fn read_mesh_coordinates(&self) -> Result<(Vec<f64>, Vec<f64>)> {
@@ -203,6 +228,14 @@ impl MpasSource {
             });
         }
         Ok(values)
+    }
+}
+
+fn open_mesh_source(path: &Path) -> Result<Box<dyn MeshValueSource>> {
+    if super::netcdf3::is_netcdf3(path) {
+        Ok(Box::new(NetCdf3Source::open(path)?) as Box<dyn MeshValueSource>)
+    } else {
+        Ok(Box::new(NetCdf4Source::open(path)?) as Box<dyn MeshValueSource>)
     }
 }
 

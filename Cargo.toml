@@ -33,6 +33,7 @@ grib = { version = "0.18.4", default-features = false, features = ["jpeg2000-unp
 image = { version = "0.25.10", default-features = false }
 kiddo = { version = "6.3", default-features = false }
 ndarray = "0.17.2"
+netcdf3 = "0.6.1"
 object_store = { version = "=0.14.1", default-features = false, features = ["aws-base", "azure-base", "gcp-base", "reqwest", "ring"] }
 oxih5 = "0.1"
 oxinetcdf = "0.1"

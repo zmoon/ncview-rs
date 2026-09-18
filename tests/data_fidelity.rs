@@ -183,7 +183,7 @@ fn packed_values_mask_before_unpacking_and_preserve_nonfinite_classes() {
 }
 
 #[test]
-fn format_boundary_rejects_netcdf3_and_non_hdf5_before_terminal_entry() {
+fn format_boundary_rejects_malformed_netcdf3_and_non_hdf5_before_terminal_entry() {
     let directory = tempfile::tempdir().unwrap();
     let netcdf3 = directory.path().join("legacy.nc");
     std::fs::write(&netcdf3, b"CDF\x01unsupported").unwrap();
@@ -191,7 +191,7 @@ fn format_boundary_rejects_netcdf3_and_non_hdf5_before_terminal_entry() {
         Ok(_) => panic!("legacy file opened"),
         Err(error) => error,
     };
-    assert!(error.to_string().contains("NetCDF-3 is unsupported"));
+    assert!(error.to_string().contains("invalid dataset") || error.to_string().contains("adapter"));
 
     let hdf5 = directory.path().join("ordinary.h5");
     let mut file = std::fs::File::create(&hdf5).unwrap();
