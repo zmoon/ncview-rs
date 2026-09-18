@@ -180,7 +180,10 @@ pub fn open(path: impl AsRef<Path>) -> Result<Box<dyn DataSource>> {
     open_with_grid(path, None::<&Path>)
 }
 
-pub fn open_with_grid(path: impl AsRef<Path>, grid_path: Option<&Path>) -> Result<Box<dyn DataSource>> {
+pub fn open_with_grid(
+    path: impl AsRef<Path>,
+    grid_path: Option<&Path>,
+) -> Result<Box<dyn DataSource>> {
     let path = path.as_ref();
     let grid_path = grid_path;
     let extension_matches = path
@@ -207,7 +210,8 @@ pub fn open_with_grid(path: impl AsRef<Path>, grid_path: Option<&Path>) -> Resul
             if path_for_grid.is_none() {
                 path_for_grid = Some(path);
             }
-            let wrapped = mpas::MpasSource::open(path, path_for_grid).map(|source| source as Box<dyn DataSource>)?;
+            let wrapped = mpas::MpasSource::open(path, path_for_grid)
+                .map(|source| source as Box<dyn DataSource>)?;
             if matches!(mesh, mpas::MeshLocation::Cell | mpas::MeshLocation::Vertex) {
                 return Ok(wrapped);
             }

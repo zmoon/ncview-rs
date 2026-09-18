@@ -408,6 +408,58 @@ impl DataSource for NetCdf4Source {
 }
 
 impl NetCdf4Source {
+    pub(crate) fn read_variable_values(&self, requested: &str) -> Result<Vec<f64>> {
+        let (_, variable) =
+            self.find_variable(requested)
+                .ok_or_else(|| NcvError::UnsupportedVariable {
+                    variable: requested.to_string(),
+                    reason: "variable not found".into(),
+                })?;
+        let shape = variable
+            .shape
+            .iter()
+            .map(|size| {
+                usize::try_from(*size)
+                    .map_err(|_| NcvError::InvalidSlice("dimension exceeds usize".into()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let ranges = variable
+            .shape
+            .iter()
+            .map(|&size| {
+                let length = usize::try_from(size)
+                    .map_err(|_| NcvError::InvalidSlice("dimension exceeds usize".into()))?;
+                Ok(0..length)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let dataset = self
+            .file
+            .h5()
+            .dataset_slice(&variable.h5_path, &ranges)
+            .map_err(|error| NcvError::Adapter {
+                path: self.path.clone(),
+                reason: error.to_string(),
+            })?;
+        let raw =
+            dataset_as_f64(&dataset, &variable.nc_type()).map_err(|error| NcvError::Adapter {
+                path: self.path.clone(),
+                reason: error.to_string(),
+            })?;
+        let (values, _) = classify_packed(&raw, packed_attributes(variable));
+        if values.len() != shape.iter().product::<usize>() {
+            return Err(NcvError::Adapter {
+                path: self.path.clone(),
+                reason: format!(
+                    "variable {} returned {} values, expected {}",
+                    requested,
+                    values.len(),
+                    shape.iter().product::<usize>()
+                ),
+            });
+        }
+        Ok(values)
+    }
+
     fn read_coordinate_values_cached(&self, variable: &oxinetcdf::NcVariable) -> Result<Vec<f64>> {
         if let Ok(cache) = self.coord_cache.lock()
             && let Some(cached) = cache.get(&variable.h5_path)

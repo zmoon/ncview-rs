@@ -1,8 +1,16 @@
 use std::path::{Path, PathBuf};
 
+use ndarray::Array2;
+
+use crate::analysis::projection::ProjectionIndex;
 use crate::error::{NcvError, Result};
 
-use super::{DataSource, DatasetMetadata, netcdf4::NetCdf4Source};
+use super::{
+    DataSource, DatasetMetadata,
+    netcdf4::NetCdf4Source,
+    normalize_longitude,
+    slice::{Bounds, CoordinateGrid, Slice2D, Validity},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeshLocation {
@@ -27,30 +35,129 @@ impl MeshLocation {
 }
 
 pub struct MpasSource {
-    inner: Box<dyn DataSource>,
+    inner: NetCdf4Source,
     mesh: MeshLocation,
-    grid: Option<Box<dyn DataSource>>,
+    grid: Option<NetCdf4Source>,
     path: PathBuf,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn radians_to_degrees_and_wrap_longitude() {
+        let latitude = radians_to_degrees(0.5);
+        let longitude = normalize_longitude_degrees(540.0);
+
+        assert!((latitude - 28.64788975654116).abs() < 1e-9);
+        assert!((longitude - (-180.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn resamples_to_requested_window() {
+        let mesh_lat = vec![0.0, 0.0, 0.0, 0.0];
+        let mesh_lon = vec![0.0, 90.0, 180.0, -90.0];
+        let values = vec![1.0, 2.0, 3.0, 4.0];
+        let bounds = Bounds::new(0, 2, 0, 2).unwrap();
+        let (lat_axis, lon_axis, output) = synthetic_window(&mesh_lat, &mesh_lon, &values, bounds);
+
+        assert_eq!(output.nrows(), 2);
+        assert_eq!(output.ncols(), 2);
+        assert_eq!(lat_axis.len(), 2);
+        assert_eq!(lon_axis.len(), 2);
+        assert!(output.iter().all(|value| value.is_finite()));
+    }
+}
+
+fn radians_to_degrees(value: f64) -> f64 {
+    value * 180.0 / std::f64::consts::PI
+}
+
+fn normalize_longitude_degrees(value: f64) -> f64 {
+    normalize_longitude(value)
+}
+
+fn synthetic_window(
+    lat: &[f64],
+    lon: &[f64],
+    values: &[f64],
+    bounds: Bounds,
+) -> (Vec<f64>, Vec<f64>, Array2<f64>) {
+    let rows = bounds.row_end - bounds.row_start;
+    let cols = bounds.col_end - bounds.col_start;
+    let lat_min = lat
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .fold(f64::INFINITY, f64::min);
+    let lat_max = lat
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .fold(f64::NEG_INFINITY, f64::max);
+    let lon_min = lon
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .fold(f64::INFINITY, f64::min);
+    let lon_max = lon
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .fold(f64::NEG_INFINITY, f64::max);
+    let lat_axis: Vec<f64> = (0..rows)
+        .map(|row| {
+            let t = if rows == 1 {
+                0.5
+            } else {
+                (row as f64 + 0.5) / rows as f64
+            };
+            lat_min + t * (lat_max - lat_min)
+        })
+        .collect();
+    let lon_axis: Vec<f64> = (0..cols)
+        .map(|col| {
+            let t = if cols == 1 {
+                0.5
+            } else {
+                (col as f64 + 0.5) / cols as f64
+            };
+            lon_min + t * (lon_max - lon_min)
+        })
+        .collect();
+    let projection = ProjectionIndex::build(lat, lon, lat.len().max(1));
+    let output = Array2::from_shape_fn((rows, cols), |(row, col)| {
+        let latitude = lat_axis[row];
+        let longitude = lon_axis[col];
+        projection
+            .nearest(latitude, longitude)
+            .and_then(|source| {
+                values
+                    .get((source.row * lat.len().max(1)) + source.col)
+                    .copied()
+            })
+            .unwrap_or(f64::NAN)
+    });
+    (lat_axis, lon_axis, output)
 }
 
 impl MpasSource {
     pub fn open(path: &Path, grid_path: Option<&Path>) -> Result<Box<dyn DataSource>> {
         let source = NetCdf4Source::open(path)?;
         let metadata = source.metadata().clone();
-        let mesh = detect(&metadata).ok_or_else(|| {
-            NcvError::InvalidDataset {
-                path: path.to_path_buf(),
-                reason: format!(
-                    "MPAS mesh detection failed for {}; expected nCells or nVertices metadata",
-                    path.display()
-                ),
-            }
+        let mesh = detect(&metadata).ok_or_else(|| NcvError::InvalidDataset {
+            path: path.to_path_buf(),
+            reason: format!(
+                "MPAS mesh detection failed for {}; expected nCells or nVertices metadata",
+                path.display()
+            ),
         })?;
 
         let has_local_coordinates = local_coordinates_present(&metadata, mesh);
         if has_local_coordinates {
             return Ok(Box::new(Self {
-                inner: Box::new(source),
+                inner: source,
                 mesh,
                 grid: None,
                 path: path.to_path_buf(),
@@ -58,10 +165,9 @@ impl MpasSource {
         }
 
         let Some(grid_path) = grid_path.or_else(|| {
-            metadata
-                .variables
-                .iter()
-                .find_map(|variable| (variable.name == "latCell" || variable.name == "lonCell").then_some(path))
+            metadata.variables.iter().find_map(|variable| {
+                (variable.name == "latCell" || variable.name == "lonCell").then_some(path)
+            })
         }) else {
             return Err(NcvError::InvalidDataset {
                 path: path.to_path_buf(),
@@ -74,11 +180,54 @@ impl MpasSource {
 
         let grid_source = NetCdf4Source::open(grid_path)?;
         Ok(Box::new(Self {
-            inner: Box::new(source),
+            inner: source,
             mesh,
-            grid: Some(Box::new(grid_source) as Box<dyn DataSource>),
+            grid: Some(grid_source),
             path: path.to_path_buf(),
         }) as Box<dyn DataSource>)
+    }
+
+    fn coordinate_source(&self) -> &NetCdf4Source {
+        self.grid.as_ref().unwrap_or(&self.inner)
+    }
+
+    fn read_mesh_coordinates(&self) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>)> {
+        let (lat_name, lon_name) = self.mesh.coordinate_names();
+        let source = self.coordinate_source();
+        let lat = source.read_variable_values(lat_name)?;
+        let lon = source.read_variable_values(lon_name)?;
+        if lat.len() != lon.len() {
+            return Err(NcvError::InvalidDataset {
+                path: self.path.clone(),
+                reason: format!(
+                    "MPAS mesh coordinate lengths differ: {} lat values vs {} lon values",
+                    lat.len(),
+                    lon.len()
+                ),
+            });
+        }
+        let values = lat
+            .iter()
+            .zip(lon.iter())
+            .filter_map(|(&lat_radians, &lon_radians)| {
+                let latitude = radians_to_degrees(lat_radians);
+                let longitude = normalize_longitude_degrees(radians_to_degrees(lon_radians));
+                (latitude.is_finite() && longitude.is_finite()).then_some((latitude, longitude))
+            })
+            .unzip::<_, _, Vec<_>, Vec<_>>();
+        let (lat_deg, lon_deg) = values;
+        Ok((lat_deg, lon_deg, vec![]))
+    }
+
+    fn read_mesh_values_for_variable(&self, variable: &str) -> Result<Vec<f64>> {
+        let values = self.inner.read_variable_values(variable)?;
+        if values.is_empty() {
+            return Err(NcvError::InvalidDataset {
+                path: self.path.clone(),
+                reason: format!("MPAS mesh variable '{variable}' is empty"),
+            });
+        }
+        Ok(values)
     }
 }
 
@@ -88,7 +237,120 @@ impl DataSource for MpasSource {
     }
 
     fn read_slice(&self, request: &super::slice::SliceRequest) -> Result<super::slice::Slice2D> {
-        self.inner.read_slice(request)
+        let mesh_values = self.read_mesh_values_for_variable(&request.variable)?;
+        let (lat_deg, lon_deg) = {
+            let source = self.coordinate_source();
+            let lat = source.read_variable_values(self.mesh.coordinate_names().0)?;
+            let lon = source.read_variable_values(self.mesh.coordinate_names().1)?;
+            if lat.len() != lon.len() || lat.len() != mesh_values.len() {
+                return Err(NcvError::InvalidDataset {
+                    path: self.path.clone(),
+                    reason: format!(
+                        "MPAS mesh length mismatch for {}: {} lat values, {} lon values, {} data values",
+                        request.variable,
+                        lat.len(),
+                        lon.len(),
+                        mesh_values.len()
+                    ),
+                });
+            }
+            let lat_deg = lat
+                .iter()
+                .map(|value| radians_to_degrees(*value))
+                .collect::<Vec<_>>();
+            let lon_deg = lon
+                .iter()
+                .map(|value| normalize_longitude_degrees(radians_to_degrees(*value)))
+                .collect::<Vec<_>>();
+            (lat_deg, lon_deg)
+        };
+
+        let rows = request
+            .bounds
+            .row_end
+            .saturating_sub(request.bounds.row_start);
+        let cols = request
+            .bounds
+            .col_end
+            .saturating_sub(request.bounds.col_start);
+        if rows == 0 || cols == 0 {
+            return Err(NcvError::InvalidSlice(
+                "requested MPAS window is empty".into(),
+            ));
+        }
+
+        let lat_min = lat_deg
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .fold(f64::INFINITY, f64::min);
+        let lat_max = lat_deg
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .fold(f64::NEG_INFINITY, f64::max);
+        let lon_min = lon_deg
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .fold(f64::INFINITY, f64::min);
+        let lon_max = lon_deg
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .fold(f64::NEG_INFINITY, f64::max);
+
+        let mut latitude_axis = Vec::with_capacity(rows);
+        let mut longitude_axis = Vec::with_capacity(cols);
+        if lat_min.is_finite() && lat_max.is_finite() && lon_min.is_finite() && lon_max.is_finite()
+        {
+            for row in 0..rows {
+                let t = if rows == 1 {
+                    0.5
+                } else {
+                    (row as f64 + 0.5) / rows as f64
+                };
+                latitude_axis.push(lat_min + t * (lat_max - lat_min));
+            }
+            for col in 0..cols {
+                let t = if cols == 1 {
+                    0.5
+                } else {
+                    (col as f64 + 0.5) / cols as f64
+                };
+                longitude_axis.push(lon_min + t * (lon_max - lon_min));
+            }
+        }
+
+        let projection = ProjectionIndex::build(&lat_deg, &lon_deg, lat_deg.len().max(1));
+        let values = Array2::from_shape_fn((rows, cols), |(row, col)| {
+            let latitude = latitude_axis.get(row).copied().unwrap_or(f64::NAN);
+            let longitude = longitude_axis.get(col).copied().unwrap_or(f64::NAN);
+            projection
+                .nearest(latitude, longitude)
+                .and_then(|source| {
+                    let source_index = source.row * lat_deg.len().max(1) + source.col;
+                    mesh_values.get(source_index).copied()
+                })
+                .unwrap_or(f64::NAN)
+        });
+        let validity = Array2::from_shape_fn((rows, cols), |(_, _)| Validity::Finite);
+        let mut slice = Slice2D::new(values.clone(), validity, request.bounds)?;
+        slice = slice.with_coordinates(CoordinateGrid {
+            latitude: None,
+            longitude: None,
+            latitude_axis: if latitude_axis.is_empty() {
+                None
+            } else {
+                Some(latitude_axis)
+            },
+            longitude_axis: if longitude_axis.is_empty() {
+                None
+            } else {
+                Some(longitude_axis)
+            },
+        });
+        Ok(slice)
     }
 
     fn read_slice_on_axes(
@@ -98,7 +360,8 @@ impl DataSource for MpasSource {
         col_axis: Option<&str>,
         fixed_axes: &[(String, usize)],
     ) -> Result<super::slice::Slice2D> {
-        self.inner.read_slice_on_axes(request, row_axis, col_axis, fixed_axes)
+        let _ = (row_axis, col_axis, fixed_axes);
+        self.read_slice(request)
     }
 
     fn time_label(&self, index: usize) -> Option<String> {
@@ -113,7 +376,12 @@ impl DataSource for MpasSource {
         self.inner.dimension_values(variable, dimension)
     }
 
-    fn point_coordinates(&self, _variable: &str, _row: usize, _col: usize) -> super::PointCoordinates {
+    fn point_coordinates(
+        &self,
+        _variable: &str,
+        _row: usize,
+        _col: usize,
+    ) -> super::PointCoordinates {
         super::PointCoordinates::default()
     }
 }
