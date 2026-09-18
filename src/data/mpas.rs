@@ -9,8 +9,11 @@ use super::{
     DataSource, DatasetMetadata,
     netcdf4::NetCdf4Source,
     normalize_longitude,
-    slice::{Bounds, CoordinateGrid, Slice2D, Validity},
+    slice::{CoordinateGrid, Slice2D, Validity},
 };
+
+#[cfg(test)]
+use super::slice::Bounds;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeshLocation {
@@ -41,35 +44,6 @@ pub struct MpasSource {
     path: PathBuf,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn radians_to_degrees_and_wrap_longitude() {
-        let latitude = radians_to_degrees(0.5);
-        let longitude = normalize_longitude_degrees(540.0);
-
-        assert!((latitude - 28.64788975654116).abs() < 1e-9);
-        assert!((longitude - (-180.0)).abs() < 1e-9);
-    }
-
-    #[test]
-    fn resamples_to_requested_window() {
-        let mesh_lat = vec![0.0, 0.0, 0.0, 0.0];
-        let mesh_lon = vec![0.0, 90.0, 180.0, -90.0];
-        let values = vec![1.0, 2.0, 3.0, 4.0];
-        let bounds = Bounds::new(0, 2, 0, 2).unwrap();
-        let (lat_axis, lon_axis, output) = synthetic_window(&mesh_lat, &mesh_lon, &values, bounds);
-
-        assert_eq!(output.nrows(), 2);
-        assert_eq!(output.ncols(), 2);
-        assert_eq!(lat_axis.len(), 2);
-        assert_eq!(lon_axis.len(), 2);
-        assert!(output.iter().all(|value| value.is_finite()));
-    }
-}
-
 fn radians_to_degrees(value: f64) -> f64 {
     value * 180.0 / std::f64::consts::PI
 }
@@ -78,6 +52,7 @@ fn normalize_longitude_degrees(value: f64) -> f64 {
     normalize_longitude(value)
 }
 
+#[cfg(test)]
 fn synthetic_window(
     lat: &[f64],
     lon: &[f64],
@@ -191,7 +166,7 @@ impl MpasSource {
         self.grid.as_ref().unwrap_or(&self.inner)
     }
 
-    fn read_mesh_coordinates(&self) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>)> {
+    fn read_mesh_coordinates(&self) -> Result<(Vec<f64>, Vec<f64>)> {
         let (lat_name, lon_name) = self.mesh.coordinate_names();
         let source = self.coordinate_source();
         let lat = source.read_variable_values(lat_name)?;
@@ -216,7 +191,7 @@ impl MpasSource {
             })
             .unzip::<_, _, Vec<_>, Vec<_>>();
         let (lat_deg, lon_deg) = values;
-        Ok((lat_deg, lon_deg, vec![]))
+        Ok((lat_deg, lon_deg))
     }
 
     fn read_mesh_values_for_variable(&self, variable: &str) -> Result<Vec<f64>> {
@@ -238,32 +213,18 @@ impl DataSource for MpasSource {
 
     fn read_slice(&self, request: &super::slice::SliceRequest) -> Result<super::slice::Slice2D> {
         let mesh_values = self.read_mesh_values_for_variable(&request.variable)?;
-        let (lat_deg, lon_deg) = {
-            let source = self.coordinate_source();
-            let lat = source.read_variable_values(self.mesh.coordinate_names().0)?;
-            let lon = source.read_variable_values(self.mesh.coordinate_names().1)?;
-            if lat.len() != lon.len() || lat.len() != mesh_values.len() {
-                return Err(NcvError::InvalidDataset {
-                    path: self.path.clone(),
-                    reason: format!(
-                        "MPAS mesh length mismatch for {}: {} lat values, {} lon values, {} data values",
-                        request.variable,
-                        lat.len(),
-                        lon.len(),
-                        mesh_values.len()
-                    ),
-                });
-            }
-            let lat_deg = lat
-                .iter()
-                .map(|value| radians_to_degrees(*value))
-                .collect::<Vec<_>>();
-            let lon_deg = lon
-                .iter()
-                .map(|value| normalize_longitude_degrees(radians_to_degrees(*value)))
-                .collect::<Vec<_>>();
-            (lat_deg, lon_deg)
-        };
+        let (lat_deg, lon_deg) = self.read_mesh_coordinates()?;
+        if lat_deg.len() != mesh_values.len() {
+            return Err(NcvError::InvalidDataset {
+                path: self.path.clone(),
+                reason: format!(
+                    "MPAS mesh length mismatch for {}: {} coordinate values, {} data values",
+                    request.variable,
+                    lat_deg.len(),
+                    mesh_values.len()
+                ),
+            });
+        }
 
         let rows = request
             .bounds
@@ -410,4 +371,33 @@ fn local_coordinates_present(metadata: &DatasetMetadata, mesh: MeshLocation) -> 
         .variables
         .iter()
         .any(|variable| variable.name == lat_name || variable.name == lon_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn radians_to_degrees_and_wrap_longitude() {
+        let latitude = radians_to_degrees(0.5);
+        let longitude = normalize_longitude_degrees(540.0);
+
+        assert!((latitude - 28.64788975654116).abs() < 1e-9);
+        assert!((longitude - (-180.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn resamples_to_requested_window() {
+        let mesh_lat = vec![0.0, 0.0, 0.0, 0.0];
+        let mesh_lon = vec![0.0, 90.0, 180.0, -90.0];
+        let values = vec![1.0, 2.0, 3.0, 4.0];
+        let bounds = Bounds::new(0, 2, 0, 2).unwrap();
+        let (lat_axis, lon_axis, output) = synthetic_window(&mesh_lat, &mesh_lon, &values, bounds);
+
+        assert_eq!(output.nrows(), 2);
+        assert_eq!(output.ncols(), 2);
+        assert_eq!(lat_axis.len(), 2);
+        assert_eq!(lon_axis.len(), 2);
+        assert!(output.iter().all(|value| value.is_finite()));
+    }
 }

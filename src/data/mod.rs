@@ -185,7 +185,6 @@ pub fn open_with_grid(
     grid_path: Option<&Path>,
 ) -> Result<Box<dyn DataSource>> {
     let path = path.as_ref();
-    let grid_path = grid_path;
     let extension_matches = path
         .extension()
         .and_then(|extension| extension.to_str())
