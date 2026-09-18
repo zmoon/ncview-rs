@@ -78,6 +78,12 @@ pub fn normalize_longitude(value: f64) -> f64 {
     }
 }
 
+pub fn is_mesh_variable(variable: &Variable) -> bool {
+    variable.dimensions.iter().any(|dimension| {
+        dimension.eq_ignore_ascii_case("nCells") || dimension.eq_ignore_ascii_case("nVertices")
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatasetMetadata {
     pub path: String,

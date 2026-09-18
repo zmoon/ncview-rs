@@ -347,7 +347,10 @@ fn render_variable_browser(
     let plottable = metadata
         .variables
         .iter()
-        .filter(|variable| variable.numeric && variable.dimensions.len() >= 2)
+        .filter(|variable| {
+            variable.numeric
+                && (crate::data::is_mesh_variable(variable) || variable.dimensions.len() >= 2)
+        })
         .cloned()
         .collect::<Vec<Variable>>();
     let filtered = sidebar::filter_variables(&plottable, variable_query);

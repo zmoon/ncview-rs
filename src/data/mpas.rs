@@ -392,12 +392,12 @@ pub(crate) fn select_mesh_values(
     Ok(output)
 }
 
-fn is_time_dimension(name: &str) -> bool {
+pub(crate) fn is_time_dimension(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower.contains("time") || lower == "date" || lower == "dates"
 }
 
-fn is_vertical_dimension(name: &str) -> bool {
+pub(crate) fn is_vertical_dimension(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower.contains("depth")
         || lower.contains("level")

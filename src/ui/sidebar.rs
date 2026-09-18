@@ -129,7 +129,10 @@ pub fn render_with_search(
     let plottable = metadata
         .variables
         .iter()
-        .filter(|variable| variable.numeric && variable.dimensions.len() >= 2)
+        .filter(|variable| {
+            variable.numeric
+                && (crate::data::is_mesh_variable(variable) || variable.dimensions.len() >= 2)
+        })
         .cloned()
         .collect::<Vec<_>>();
     let variables = filter_variables(&plottable, variable_query)

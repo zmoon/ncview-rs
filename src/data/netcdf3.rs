@@ -1,12 +1,11 @@
 use std::{
     fs::File,
-    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::Mutex,
 };
 
 use ndarray::Array2;
-use netcdf_reader::{NcAttrValue, NcFile, NcType};
+use netcdf_reader::{NcAttrValue, NcFile, NcSliceInfo, NcSliceInfoElem, NcType};
 
 use super::slice::{Slice2D, SliceRequest, Validity};
 use super::{
@@ -79,63 +78,41 @@ impl NetCdf3Source {
                 variable: variable.to_owned(),
                 reason: "variable not found".into(),
             })?;
-        if !selected.is_record_var {
-            let values =
-                reader
-                    .read_variable_as_f64(variable)
-                    .map_err(|error| NcvError::Adapter {
-                        path: self.path.clone(),
-                        reason: error.to_string(),
-                    })?;
-            return super::mpas::select_mesh_values(
-                &values.into_iter().collect::<Vec<_>>(),
-                &self.metadata,
-                variable,
-                mesh_dimension,
-                time,
-                depth,
-            );
-        }
-
-        let element_size = selected.dtype.size().map_err(|error| NcvError::Adapter {
-            path: self.path.clone(),
-            reason: error.to_string(),
-        })?;
-        let record_bytes = usize::try_from(selected.record_size).map_err(|_| {
-            NcvError::InvalidSlice("NetCDF-3 record size exceeds platform usize".into())
-        })?;
-        let record_stride = record_stride(variables)?;
-        let variable_offset = variables
+        let selections = selected
+            .dimensions
             .iter()
-            .filter(|candidate| candidate.is_record_var)
-            .take_while(|candidate| candidate.name != selected.name)
-            .try_fold(0_u64, |offset, candidate| {
-                offset.checked_add(padded_record_size(candidate.record_size))
+            .map(|dimension| {
+                if dimension.name == mesh_dimension {
+                    Ok(NcSliceInfoElem::Slice {
+                        start: 0,
+                        end: dimension.size,
+                        step: 1,
+                    })
+                } else if super::mpas::is_time_dimension(&dimension.name) {
+                    Ok(NcSliceInfoElem::Index(time as u64))
+                } else if super::mpas::is_vertical_dimension(&dimension.name) {
+                    Ok(NcSliceInfoElem::Index(depth as u64))
+                } else if dimension.size == 1 {
+                    Ok(NcSliceInfoElem::Index(0))
+                } else {
+                    Err(NcvError::UnsupportedVariable {
+                        variable: variable.to_owned(),
+                        reason: format!(
+                            "non-spatial dimension '{}' needs a time/depth role",
+                            dimension.name
+                        ),
+                    })
+                }
             })
-            .ok_or_else(|| NcvError::InvalidSlice("NetCDF-3 record offset overflows".into()))?;
-        let offset =
-            selected
-                .data_offset
-                .checked_add((time as u64).checked_mul(record_stride).ok_or_else(|| {
-                    NcvError::InvalidSlice("NetCDF-3 record offset overflows".into())
-                })?)
-                .and_then(|offset| offset.checked_add(variable_offset))
-                .ok_or_else(|| NcvError::InvalidSlice("NetCDF-3 record offset overflows".into()))?;
-        let mut file = File::open(&self.path).map_err(|source| NcvError::Io {
-            path: self.path.clone(),
-            source,
-        })?;
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|source| NcvError::Io {
-                path: self.path.clone(),
-                source,
+            .collect::<Result<Vec<_>>>()?;
+        let selection = NcSliceInfo { selections };
+        let values =
+            read_selected_f64(&reader, variable, &selected.dtype, &selection).map_err(|error| {
+                NcvError::Adapter {
+                    path: self.path.clone(),
+                    reason: error.to_string(),
+                }
             })?;
-        let mut raw = vec![0_u8; record_bytes];
-        file.read_exact(&mut raw).map_err(|source| NcvError::Io {
-            path: self.path.clone(),
-            source,
-        })?;
-        let values = decode_numeric(&raw, &selected.dtype, record_bytes / element_size)?;
         super::mpas::select_mesh_values(
             &values,
             &self.metadata,
@@ -147,66 +124,39 @@ impl NetCdf3Source {
     }
 }
 
-fn padded_record_size(size: u64) -> u64 {
-    let remainder = size % 4;
-    if remainder == 0 {
-        size
-    } else {
-        size + 4 - remainder
-    }
-}
-
-fn record_stride(variables: &[netcdf_reader::NcVariable]) -> Result<u64> {
-    let record_variables = variables
-        .iter()
-        .filter(|variable| variable.is_record_var)
-        .collect::<Vec<_>>();
-    if record_variables.len() == 1 {
-        return Ok(record_variables[0].record_size);
-    }
-    record_variables.iter().try_fold(0_u64, |stride, variable| {
-        stride
-            .checked_add(padded_record_size(variable.record_size))
-            .ok_or_else(|| NcvError::InvalidSlice("NetCDF-3 record stride overflows".into()))
-    })
-}
-
-fn decode_numeric(raw: &[u8], dtype: &NcType, count: usize) -> Result<Vec<f64>> {
-    let size = dtype.size().map_err(|error| NcvError::Adapter {
-        path: PathBuf::new(),
-        reason: error.to_string(),
-    })?;
-    if raw.len() < count.saturating_mul(size) {
-        return Err(NcvError::Adapter {
-            path: PathBuf::new(),
-            reason: "NetCDF-3 record payload is truncated".into(),
-        });
-    }
-    let mut values = Vec::with_capacity(count);
-    for chunk in raw[..count * size].chunks_exact(size) {
-        let value = match dtype {
-            NcType::Byte => f64::from(chunk[0] as i8),
-            NcType::UByte => f64::from(chunk[0]),
-            NcType::Short => f64::from(i16::from_be_bytes([chunk[0], chunk[1]])),
-            NcType::UShort => f64::from(u16::from_be_bytes([chunk[0], chunk[1]])),
-            NcType::Int => f64::from(i32::from_be_bytes(chunk.try_into().unwrap())),
-            NcType::UInt => u32::from_be_bytes(chunk.try_into().unwrap()) as f64,
-            NcType::Float => f64::from(f32::from_bits(u32::from_be_bytes(
-                chunk.try_into().unwrap(),
-            ))),
-            NcType::Double => f64::from_bits(u64::from_be_bytes(chunk.try_into().unwrap())),
-            NcType::Int64 => i64::from_be_bytes(chunk.try_into().unwrap()) as f64,
-            NcType::UInt64 => u64::from_be_bytes(chunk.try_into().unwrap()) as f64,
-            _ => {
-                return Err(NcvError::UnsupportedVariable {
-                    variable: "record variable".into(),
-                    reason: format!("non-numeric NetCDF-3 type {dtype:?}"),
-                });
-            }
+fn read_selected_f64(
+    reader: &NcFile,
+    variable: &str,
+    dtype: &NcType,
+    selection: &NcSliceInfo,
+) -> Result<Vec<f64>> {
+    macro_rules! read {
+        ($type:ty) => {
+            reader
+                .read_variable_slice::<$type>(variable, selection)
+                .map(|values| values.into_iter().map(|value| value as f64).collect())
+                .map_err(|error| NcvError::Adapter {
+                    path: PathBuf::new(),
+                    reason: error.to_string(),
+                })
         };
-        values.push(value);
     }
-    Ok(values)
+    match dtype {
+        NcType::Byte => read!(i8),
+        NcType::UByte => read!(u8),
+        NcType::Short => read!(i16),
+        NcType::UShort => read!(u16),
+        NcType::Int => read!(i32),
+        NcType::UInt => read!(u32),
+        NcType::Float => read!(f32),
+        NcType::Double => read!(f64),
+        NcType::Int64 => read!(i64),
+        NcType::UInt64 => read!(u64),
+        _ => Err(NcvError::UnsupportedVariable {
+            variable: variable.to_owned(),
+            reason: format!("non-numeric NetCDF-3 type {dtype:?}"),
+        }),
+    }
 }
 
 impl DataSource for NetCdf3Source {

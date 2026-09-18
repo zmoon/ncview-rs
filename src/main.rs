@@ -328,7 +328,7 @@ fn run(datasets: &[String], grid: Option<&str>) -> Result<(), Box<dyn std::error
             .metadata()
             .variables
             .iter()
-            .find(|variable| variable.numeric && variable.dimensions.len() >= 2)
+            .find(|variable| variable.numeric && plottable_variable(variable))
             .map(|variable| variable.name.clone());
         let base_label = first_variable
             .as_deref()
@@ -796,7 +796,7 @@ fn collection_variables(sources: &[Arc<dyn data::DataSource>]) -> Vec<Variable> 
             .metadata()
             .variables
             .iter()
-            .filter(|variable| variable.numeric && variable.dimensions.len() >= 2)
+            .filter(|variable| variable.numeric && plottable_variable(variable))
         {
             if !variables
                 .iter()
@@ -929,7 +929,7 @@ impl LazyRemoteGribSource {
             .metadata()
             .variables
             .get(ordinal)
-            .filter(|variable| variable.numeric && variable.dimensions.len() >= 2)
+            .filter(|variable| variable.numeric && plottable_variable(variable))
             .map(|variable| variable.name.clone())
             .ok_or_else(|| {
                 format!(
@@ -1090,7 +1090,7 @@ fn state_for_source(source: &dyn data::DataSource) -> AppState {
             .metadata()
             .variables
             .iter()
-            .filter(|variable| variable.numeric && variable.dimensions.len() >= 2)
+            .filter(|variable| variable.numeric && plottable_variable(variable))
             .cloned()
             .collect(),
         ..AppState::default()
@@ -1370,7 +1370,7 @@ fn level_geometry(
     let plottable_all: Vec<_> = metadata
         .variables
         .iter()
-        .filter(|variable| variable.numeric && variable.dimensions.len() >= 2)
+        .filter(|variable| variable.numeric && plottable_variable(variable))
         .cloned()
         .collect();
     let filtered = ncview_rs::ui::sidebar::filter_variables(&plottable_all, variable_query);
@@ -1418,7 +1418,7 @@ fn translate_sidebar_position(
     let plottable_all: Vec<_> = metadata
         .variables
         .iter()
-        .filter(|variable| variable.numeric && variable.dimensions.len() >= 2)
+        .filter(|variable| variable.numeric && plottable_variable(variable))
         .cloned()
         .collect();
     let plottable = ncview_rs::ui::sidebar::filter_variables(&plottable_all, variable_query)
@@ -1647,7 +1647,7 @@ fn translate_variable_browser_click(
             let plottable = metadata
                 .variables
                 .iter()
-                .filter(|variable| variable.numeric && variable.dimensions.len() >= 2)
+                .filter(|variable| variable.numeric && plottable_variable(variable))
                 .cloned()
                 .collect::<Vec<_>>();
             let visible = ncview_rs::ui::sidebar::filter_variables(&plottable, variable_query);
@@ -1879,7 +1879,7 @@ fn select_initial_variable(state: &mut AppState, metadata: &DatasetMetadata) {
     let selected = state
         .variables
         .iter()
-        .filter(|variable| variable.numeric && variable.dimensions.len() >= 2)
+        .filter(|variable| variable.numeric && plottable_variable(variable))
         .max_by_key(|variable| {
             let area_penalty = variable.name.to_ascii_lowercase().contains("area");
             (variable.dimensions.len(), !area_penalty)
@@ -1890,7 +1890,15 @@ fn select_initial_variable(state: &mut AppState, metadata: &DatasetMetadata) {
         && let Some(metadata_variable) =
             metadata.variables.iter().find(|item| item.name == variable)
     {
-        state.view.axis_options = metadata_variable.dimensions.clone();
+        state.view.axis_options = if data::is_mesh_variable(metadata_variable) {
+            vec!["latitude".into(), "longitude".into()]
+        } else {
+            metadata_variable.dimensions.clone()
+        };
+        if data::is_mesh_variable(metadata_variable) {
+            state.view.x_axis = Some("longitude".into());
+            state.view.y_axis = Some("latitude".into());
+        }
         let (time_length, depth_length) = leading_lengths(metadata, metadata_variable);
         state.view.time_length = time_length;
         state.view.depth_length = depth_length;
@@ -1899,6 +1907,10 @@ fn select_initial_variable(state: &mut AppState, metadata: &DatasetMetadata) {
             state.variables.len()
         );
     }
+}
+
+fn plottable_variable(variable: &Variable) -> bool {
+    variable.dimensions.len() >= 2 || data::is_mesh_variable(variable)
 }
 
 fn earliest_source_index(sources: &[Arc<dyn data::DataSource>]) -> usize {
@@ -1926,7 +1938,7 @@ fn source_earliest_time(source: &dyn data::DataSource) -> Option<DateTime<Utc>> 
         .metadata()
         .variables
         .iter()
-        .filter(|variable| variable.numeric && variable.dimensions.len() >= 2)
+        .filter(|variable| variable.numeric && plottable_variable(variable))
         .flat_map(|variable| {
             let time_length = leading_lengths(source.metadata(), variable).0.max(1);
             (0..time_length).filter_map(|index| {
@@ -3038,6 +3050,10 @@ fn plane_bounds(
     x_axis: Option<&str>,
     y_axis: Option<&str>,
 ) -> Option<(Bounds, usize, usize)> {
+    if data::is_mesh_variable(variable) {
+        let (time, depth) = axis_lengths(metadata, variable);
+        return Some((Bounds::new(0, 180, 0, 360).ok()?, time, depth));
+    }
     let (Some(x_axis), Some(y_axis)) = (x_axis, y_axis) else {
         return spatial_bounds(metadata, variable);
     };
