@@ -24,11 +24,9 @@ The MPAS NetCDF-3 smoke test uses a small generated field and a real mesh downlo
 ignored integration test. CI downloads the UCAR `x1.2562` mesh before running that test; ordinary
 `cargo test` remains deterministic and does not require network access.
 
-Regenerate the committed MPAS fixture with:
-
-```sh
-cargo run --example generate_fixtures
-```
+The committed MPAS fixture is generated once and checked in because the current pure-Rust reader
+is intentionally read-only. The fixture is covered by the normal test suite and is not rewritten by
+the NetCDF-4 fixture generator.
 
 Generated fixture hashes (SHA-256):
 

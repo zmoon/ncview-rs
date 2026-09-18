@@ -5,7 +5,7 @@ use std::{
 };
 
 use ndarray::Array2;
-use netcdf3::{DataType, DataVector, FileReader};
+use netcdf_reader::{NcAttrValue, NcFile, NcType};
 
 use super::slice::{Slice2D, SliceRequest, Validity};
 use super::{
@@ -30,19 +30,30 @@ pub fn is_netcdf3(path: &Path) -> bool {
 
 impl NetCdf3Source {
     pub fn open(path: &Path) -> Result<Self> {
-        let mut reader = FileReader::open(path).map_err(|error| NcvError::InvalidDataset {
+        let reader = NcFile::open(path).map_err(|error| NcvError::InvalidDataset {
             path: path.to_path_buf(),
             reason: error.to_string(),
         })?;
-        let metadata = metadata(path, reader.data_set());
-        let names = reader.data_set().get_var_names();
-        let mut values = HashMap::with_capacity(names.len());
-        for name in names {
-            let data = reader.read_var(&name).map_err(|error| NcvError::Adapter {
+        let metadata = metadata(path, &reader)?;
+        let variables = reader
+            .variables()
+            .map_err(|error| NcvError::InvalidDataset {
                 path: path.to_path_buf(),
                 reason: error.to_string(),
             })?;
-            values.insert(name, data_vector_as_f64(data));
+        let mut values = HashMap::with_capacity(variables.len());
+        for variable in variables {
+            if !is_numeric_type(&variable.dtype) {
+                continue;
+            }
+            let name = variable.name.clone();
+            let data = reader
+                .read_variable_as_f64(&name)
+                .map_err(|error| NcvError::Adapter {
+                    path: path.to_path_buf(),
+                    reason: error.to_string(),
+                })?;
+            values.insert(name, data.into_iter().collect());
         }
         Ok(Self {
             path: path.to_path_buf(),
@@ -146,48 +157,73 @@ impl DataSource for NetCdf3Source {
     }
 }
 
-fn metadata(path: &Path, dataset: &netcdf3::DataSet) -> DatasetMetadata {
-    let dimensions = dataset
-        .get_dims()
-        .into_iter()
+fn metadata(path: &Path, file: &NcFile) -> Result<DatasetMetadata> {
+    let dimensions = file
+        .dimensions()
+        .map_err(|error| NcvError::InvalidDataset {
+            path: path.to_path_buf(),
+            reason: error.to_string(),
+        })?
+        .iter()
         .map(|dimension| Dimension {
-            name: dimension.name(),
-            length: dimension.size(),
-            role: role_for_name(&dimension.name()),
+            name: dimension.name.clone(),
+            length: usize::try_from(dimension.size).unwrap_or(usize::MAX),
+            role: role_for_name(&dimension.name),
         })
         .collect::<Vec<_>>();
-    let variables = dataset
-        .get_vars()
-        .into_iter()
-        .map(|variable| {
-            let name = variable.name().to_owned();
-            Variable {
-                name: name.clone(),
-                dimensions: variable.dim_names(),
-                numeric: !matches!(variable.data_type(), DataType::U8),
-                units: dataset.get_var_attr_as_string(&name, "units"),
-                long_name: dataset.get_var_attr_as_string(&name, "long_name"),
-                standard_name: dataset.get_var_attr_as_string(&name, "standard_name"),
-            }
+    let variables = file
+        .variables()
+        .map_err(|error| NcvError::InvalidDataset {
+            path: path.to_path_buf(),
+            reason: error.to_string(),
+        })?
+        .iter()
+        .map(|variable| Variable {
+            name: variable.name.clone(),
+            dimensions: variable
+                .dimensions
+                .iter()
+                .map(|dimension| dimension.name.clone())
+                .collect(),
+            numeric: is_numeric_type(&variable.dtype),
+            units: attribute_text(variable.attributes.as_slice(), "units"),
+            long_name: attribute_text(variable.attributes.as_slice(), "long_name"),
+            standard_name: attribute_text(variable.attributes.as_slice(), "standard_name"),
         })
         .collect();
-    DatasetMetadata {
+    Ok(DatasetMetadata {
         path: path.display().to_string(),
         format: DatasetFormat::NetCdf3,
         dimensions,
         variables,
-    }
+    })
 }
 
-fn data_vector_as_f64(values: DataVector) -> Vec<f64> {
-    match values {
-        DataVector::I8(values) => values.into_iter().map(f64::from).collect(),
-        DataVector::U8(values) => values.into_iter().map(f64::from).collect(),
-        DataVector::I16(values) => values.into_iter().map(f64::from).collect(),
-        DataVector::I32(values) => values.into_iter().map(f64::from).collect(),
-        DataVector::F32(values) => values.into_iter().map(f64::from).collect(),
-        DataVector::F64(values) => values,
-    }
+fn attribute_text(attributes: &[netcdf_reader::NcAttribute], name: &str) -> Option<String> {
+    attributes
+        .iter()
+        .find(|attribute| attribute.name == name)
+        .and_then(|attribute| match &attribute.value {
+            NcAttrValue::Chars(value) => Some(value.clone()),
+            NcAttrValue::Strings(values) => values.first().cloned(),
+            _ => None,
+        })
+}
+
+fn is_numeric_type(dtype: &NcType) -> bool {
+    matches!(
+        dtype,
+        NcType::Byte
+            | NcType::Short
+            | NcType::Int
+            | NcType::Float
+            | NcType::Double
+            | NcType::UByte
+            | NcType::UShort
+            | NcType::UInt
+            | NcType::Int64
+            | NcType::UInt64
+    )
 }
 
 fn role_for_name(name: &str) -> AxisRole {

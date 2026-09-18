@@ -305,12 +305,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "byteorder"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
-
-[[package]]
 name = "byteorder-lite"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1846,7 +1840,7 @@ dependencies = [
  "kiddo",
  "libsqlite3-sys",
  "ndarray",
- "netcdf3",
+ "netcdf-reader",
  "object_store",
  "oxih5",
  "oxinetcdf",
@@ -1882,22 +1876,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "netcdf3"
-version = "0.6.1"
+name = "netcdf-core"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "395ef44a0c89b4cf05950c71592d62617e7d2587183b3532ed6fe96e4dcc19f8"
+checksum = "25a7215ebd56ede9f76768a895593673ca072b67764f3abff7393be0de0dbaf4"
 dependencies = [
- "byteorder",
- "nom",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
-name = "nom"
-version = "8.0.0"
+name = "netcdf-reader"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df9761775871bdef83bee530e60050f7e54b1105350d6884eb0fb4f46c2f9405"
+checksum = "33e22b42b44c58a4fdb3c6969fdcf9bbcae71efad0ff94e2d63e21728a843f82"
 dependencies = [
- "memchr",
+ "memmap2",
+ "ndarray",
+ "netcdf-core",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
